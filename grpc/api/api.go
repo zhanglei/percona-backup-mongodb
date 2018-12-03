@@ -140,7 +140,7 @@ func (a *ApiServer) RunBackup(ctx context.Context, opts *pbapi.RunBackupParams) 
 		return &pbapi.Error{Message: err.Error()}, err
 	}
 	logger.Debug("Balancer started")
-	return &pbapi.Error{}, nil
+	return &pbapi.Error{}, a.messagesServer.LastError()
 }
 
 func (a *ApiServer) RunRestore(ctx context.Context, opts *pbapi.RunRestoreParams) (*pbapi.RunRestoreResponse, error) {

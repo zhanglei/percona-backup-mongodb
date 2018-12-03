@@ -32,7 +32,7 @@ type MessagesServer struct {
 	backupRunning         bool
 	oplogBackupRunning    bool
 	restoreRunning        bool
-	err                   error
+	lastError             error
 	//
 	workDir               string
 	clientLoggingEnabled  bool
@@ -257,6 +257,12 @@ func (s *MessagesServer) ReplicasetsRunningRestore() map[string]*Client {
 	return replicasets
 }
 
+func (s *MessagesServer) LastError() error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return s.lastError
+}
+
 // RestoreBackupFromMetadataFile is just a wrappwe around RestoreBackUp that receives a metadata filename
 // loads and parse it and then call RestoreBackUp
 func (s *MessagesServer) RestoreBackupFromMetadataFile(filename string, skipUsersAndRoles bool) error {
@@ -444,6 +450,29 @@ func (s *MessagesServer) StopOplogTail() error {
 	return nil
 }
 
+func (s *MessagesServer) StopBackup() error {
+	if !s.isOplogBackupRunning() {
+		return fmt.Errorf("Backup is not running")
+	}
+	var gErr error
+	for _, client := range s.clients {
+		s.logger.Debugf("Checking if client %s is running the oplog backup: %v", client.NodeName, client.isOplogTailerRunning())
+		if client.isDBBackupRunning() {
+			s.logger.Debugf("Stopping oplog tail in client %s at %s", client.NodeName, time.Unix(s.lastOplogTs, 0).Format(time.RFC3339))
+			err := client.stopBackup()
+			if err != nil {
+				gErr = errors.Wrapf(gErr, "client: %s, error: %s", client.NodeName, err)
+			}
+		}
+	}
+	s.setBackupRunning(false)
+
+	if gErr != nil {
+		return errors.Wrap(gErr, "cannot stop the backup")
+	}
+	return nil
+}
+
 func (s *MessagesServer) WaitBackupFinish() {
 	replicasets := s.ReplicasetsRunningDBBackup()
 	if len(replicasets) == 0 {
@@ -585,8 +614,32 @@ func (s *MessagesServer) MessagesChat(stream pb.Messages_MessagesChatServer) err
 
 	// Keep the stream open
 	<-stream.Context().Done()
+
 	if err := s.unregisterClient(clientID); err != nil {
 		s.logger.Errorf("Client %s stream was closed but cannot unregister client: %s", clientID, err)
+	}
+
+	s.lastError = nil
+	for _, client := range s.Clients() {
+		if s.isBackupRunning() {
+			if (client.isDBBackupRunning() || client.isDBBackupRunning()) && s.isBackupRunning() {
+				err := s.StopOplogTail()
+				if bckErr := s.StopBackup(); bckErr != nil {
+					err = errors.Wrap(bckErr, "cannot stop backup")
+				}
+				s.setBackupRunning(false)
+				if err != nil {
+					return err
+				}
+			}
+			notify.Post(EVENT_OPLOG_FINISH, time.Now())
+			notify.Post(EVENT_BACKUP_FINISH, time.Now())
+			s.lastError = fmt.Errorf("Backup was cancelled. Client %s has been disconnected", clientID)
+			s.StartBalancer()
+		}
+		if s.isRestoreRunning() {
+			// TODO
+		}
 	}
 
 	return nil
@@ -762,7 +815,7 @@ func (s *MessagesServer) reset() {
 	s.backupRunning = false
 	s.oplogBackupRunning = false
 	s.restoreRunning = false
-	s.err = nil
+	s.lastError = nil
 }
 
 func (s *MessagesServer) setBackupRunning(status bool) {
